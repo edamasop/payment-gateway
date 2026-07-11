@@ -13,22 +13,25 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// CreatePaymentRequest represents the request from our PaymentService to the gateway
+// CreatePaymentRequest mirrors schema.CreateGatewayPayment from the core service
 type CreatePaymentRequest struct {
-	OrderID    string          `json:"order_id"`
-	Amount     decimal.Decimal `json:"amount"`
-	Currency   string          `json:"currency"`
-	WebhookURL string          `json:"webhook_url"` // Target URL to send the payment result callback
+	PaymentID  string          `json:"payment_id"`  // Our internal DB record ID
+	OrderID    string          `json:"order_id"`    // Commercial order ID
+	Amount     decimal.Decimal `json:"amount"`      // Amount in minor units (cents/tiyn)
+	Currency   string          `json:"currency"`    // e.g., "KZT"
+	WebhookURL string          `json:"webhook_url"` // Target URL to send callback notifications
 }
 
-// CreatePaymentResponse represents the response from the gateway to our PaymentService
-type CreatePaymentResponse struct {
-	PaymentID  string `json:"payment_id"`
-	PaymentURL string `json:"payment_url"`
-	Status     string `json:"status"`
+// GatewayResponse mirrors schema.GatewayResponse expected by the core service
+type GatewayResponse struct {
+	TransactionID    string `json:"transaction_id"`
+	RedirectURL      string `json:"redirect_url"`
+	IsRejected       bool   `json:"is_rejected"`
+	IsInstantSuccess bool   `json:"is_instant_success"`
+	ErrorMessage     string `json:"error_message,omitempty"`
 }
 
-// WebhookNotification represents the webhook payload sent back after user interaction
+// WebhookNotification represents the payload sent asynchronously to the webhooks controller
 type WebhookNotification struct {
 	PaymentID string `json:"payment_id"`
 	OrderID   string `json:"order_id"`
@@ -40,9 +43,6 @@ func main() {
 	if len(args) == 0 {
 		log.Fatal("Port argument is required")
 	}
-
-	// Initialize the random generator to simulate payment variations and failures
-	rand.Seed(time.Now().UnixNano())
 
 	http.HandleFunc("/v1/charges", handleCreatePayment)
 
@@ -63,57 +63,76 @@ func handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a mock transaction ID on the gateway side
-	mockPaymentID := fmt.Sprintf("ch_%d", rand.Intn(1000000))
-	// Mock URL where the user would theoretically input their card details
-	mockPaymentURL := fmt.Sprintf("https://mock-checkout.gateway.com/pay/%s", mockPaymentID)
+	// Read Idempotency Key header if sent by the client
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
 
-	resp := CreatePaymentResponse{
-		PaymentID:  mockPaymentID,
-		PaymentURL: mockPaymentURL,
-		Status:     "PENDING",
+	// Generate a unique mock transaction ID representing the gateway asset
+	mockTxID := fmt.Sprintf("ch_%d", rand.Intn(1000000))
+	mockRedirectURL := fmt.Sprintf("https://mock-checkout.gateway.com/pay/%s", mockTxID)
+
+	resp := GatewayResponse{
+		TransactionID:    mockTxID,
+		RedirectURL:      mockRedirectURL,
+		IsRejected:       false,
+		IsInstantSuccess: false,
 	}
 
-	// Send an immediate response back to our internal PaymentService
+	// Simulation: 5% chance the gateway rejects the transaction immediately (e.g., blacklisted card)
+	// This helps test your immediate structural 'IsRejected' handling block.
+	if rand.Float32() < 0.05 {
+		resp.IsRejected = true
+		resp.RedirectURL = ""
+		resp.ErrorMessage = "Card security validation failed or merchant account restricted"
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK) // Gateway responds successfully but contains rejection status payload
+		json.NewEncoder(w).Encode(resp)
+
+		log.Printf("[Gateway Sync Rejection] Payment rejected immediately for Internal ID: %s, Order ID: %s\n", req.PaymentID, req.OrderID)
+		return
+	}
+
+	// Send an immediate successful response containing the checkout dynamic link
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(resp)
 
-	log.Printf("[Gateway] Payment session created for Order %s. Amount: %.2f %s\n", req.OrderID, req.Amount, req.Currency)
+	log.Printf("[Gateway Session Created] Reference ID: %s | Order: %s | Idempotency Key: %s | Amount: %d %s\n",
+		req.PaymentID, req.OrderID, idempotencyKey, req.Amount, req.Currency)
 
-	// Asynchronously trigger user payment simulation
-	go simulateUserPayment(req.OrderID, mockPaymentID, req.WebhookURL)
+	// Asynchronously trigger customer interaction delay & webhook dispatching thread
+	go simulateUserPayment(req.PaymentID, req.OrderID, mockTxID, req.WebhookURL)
 }
 
-// simulateUserPayment mimics user delay and webhook callback execution
-func simulateUserPayment(orderID, paymentID, webhookURL string) {
-	// Simulate delay: user takes between 3 and 5 seconds to enter details
-	holdTime := time.Duration(rand.Intn(3)+3) * time.Second
+// simulateUserPayment mimics async credit card processor delays and callback execution
+func simulateUserPayment(paymentID, orderID, txID, webhookURL string) {
+	// Simulate delay: user takes between 2 and 5 seconds to pass 3D Secure / enter dynamic OTP code
+	holdTime := time.Duration(rand.Intn(3)+2) * time.Second
 	time.Sleep(holdTime)
 
-	// Simulate payment outcome: 85% success rate, 15% failure rate (e.g., insufficient funds)
+	// Simulate authorization outcome: 80% success rate, 20% failure rate (e.g., insufficient funds)
 	status := "SUCCESSFUL"
-	if rand.Float32() < 0.15 {
+	if rand.Float32() < 0.20 {
 		status = "FAILED"
 	}
 
 	notification := WebhookNotification{
-		PaymentID: paymentID,
+		PaymentID: paymentID, // Passing back our core service internal record identity
 		OrderID:   orderID,
 		Status:    status,
 	}
 
 	payload, _ := json.Marshal(notification)
 
-	log.Printf("[Gateway] Sending webhook back to PaymentService (%s) -> Status: %s\n", webhookURL, status)
+	log.Printf("[Gateway Async Event] Sending webhook payload back to PaymentService (%s) -> Status: %s\n", webhookURL, status)
 
-	// Send HTTP POST request to the WebhookURL of our actual PaymentService
+	// Send an authoritative HTTP POST push transaction state modification to your core application listener
 	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(payload))
 	if err != nil {
-		log.Printf("[Gateway ERROR] Failed to reach PaymentService: %v\n", err)
+		log.Printf("[Gateway Network Error] Failed to reach application webhook endpoint: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Printf("[Gateway] Webhook successfully delivered, server response: %d\n", resp.StatusCode)
+	log.Printf("[Gateway Async Event] Webhook delivered securely, microservice response: %d\n", resp.StatusCode)
 }
