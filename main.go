@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -124,14 +127,24 @@ func simulateUserPayment(paymentID, orderID, txID, webhookURL string) {
 
 	payload, _ := json.Marshal(notification)
 
+	h := hmac.New(sha256.New, []byte("my-secret-key"))
+	h.Write(payload)
+	signature := hex.EncodeToString(h.Sum(nil))
+
 	log.Printf("[Gateway Async Event] Sending webhook payload back to PaymentService (%s) -> Status: %s\n", webhookURL, status)
 
-	// Send an authoritative HTTP POST push transaction state modification to your core application listener
-	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(payload))
+	req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(payload))
 	if err != nil {
-		log.Printf("[Gateway Network Error] Failed to reach application webhook endpoint: %v\n", err)
+		log.Printf("Failed to create request: %v", err)
 		return
 	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Signature", signature)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	resp, err := client.Do(req)
 	defer resp.Body.Close()
 
 	log.Printf("[Gateway Async Event] Webhook delivered securely, microservice response: %d\n", resp.StatusCode)
