@@ -7,14 +7,20 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
 )
+
+// This is a mock of an external payment provider. It intentionally keeps state
+// in memory: the goal is to exercise the payment service's HTTP and webhook
+// handling, not to be a real gateway.
 
 // CreatePaymentRequest mirrors schema.CreateGatewayPayment from the core service
 type CreatePaymentRequest struct {
@@ -41,33 +47,79 @@ type WebhookNotification struct {
 	Status    string `json:"status"` // SUCCESSFUL or FAILED
 }
 
+const (
+	// defaultPort keeps `go run .` / ./bin/payment-gateway usable without any
+	// environment; PORT or the first CLI argument override it.
+	defaultPort          = "8082"
+	defaultWebhookSecret = "dev-webhook-secret"
+
+	// Simulation modes. "random" keeps the original mock behaviour (5%
+	// synchronous rejection, 20% asynchronous failure); the other two make the
+	// outcome deterministic, which is what an end-to-end check wants.
+	simulationRandom  = "random"
+	simulationSuccess = "success"
+	simulationFailed  = "failed"
+	webhookAttempts   = 3
+	webhookTimeout    = 10 * time.Second
+)
+
+var (
+	// idempotency remembers the answer we gave for an X-Idempotency-Key. A
+	// real gateway persists this; for the mock a map is enough to show why the
+	// header exists: retrying a charge must not create a second transaction.
+	idempotencyMu sync.Mutex
+	idempotency   = make(map[string]GatewayResponse)
+
+	webhookSecret = envOr("PAYMENT_WEBHOOK_SECRET", defaultWebhookSecret)
+	simulation    = envOr("GATEWAY_SIMULATION", simulationRandom)
+)
+
 func main() {
-	args := os.Args[1:]
-	if len(args) == 0 {
-		log.Fatal("Port argument is required")
+	port := os.Getenv("PORT")
+	if len(os.Args) > 1 {
+		port = os.Args[1]
+	}
+	if port == "" {
+		port = defaultPort
 	}
 
-	http.HandleFunc("/v1/charges", handleCreatePayment)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/charges", handleCreatePayment)
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
 
-	fmt.Println("Payment Gateway Mock started on port:", args[0])
-	log.Fatal(http.ListenAndServe(":"+args[0], nil))
+	if simulation != simulationRandom && simulation != simulationSuccess && simulation != simulationFailed {
+		log.Fatalf("invalid GATEWAY_SIMULATION %q: use random, success or failed", simulation)
+	}
+
+	log.Printf("Payment Gateway Mock started on port %s (simulation: %s)", port, simulation)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func handleCreatePayment(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	var req CreatePaymentRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Read Idempotency Key header if sent by the client
 	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+
+	if idempotencyKey != "" {
+		idempotencyMu.Lock()
+		stored, ok := idempotency[idempotencyKey]
+		idempotencyMu.Unlock()
+
+		if ok {
+			log.Printf("[Gateway Idempotent Replay] key %s -> transaction %s", idempotencyKey, stored.TransactionID)
+			writeJSON(w, http.StatusOK, stored)
+			return
+		}
+	}
 
 	// Generate a unique mock transaction ID representing the gateway asset
 	mockTxID := fmt.Sprintf("ch_%d", rand.Intn(1000000))
@@ -81,30 +133,46 @@ func handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Simulation: 5% chance the gateway rejects the transaction immediately (e.g., blacklisted card)
-	// This helps test your immediate structural 'IsRejected' handling block.
-	if rand.Float32() < 0.05 {
+	// This helps test the immediate structural 'IsRejected' handling block.
+	if simulation == simulationRandom && rand.Float32() < 0.05 {
 		resp.IsRejected = true
 		resp.RedirectURL = ""
 		resp.ErrorMessage = "Card security validation failed or merchant account restricted"
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK) // Gateway responds successfully but contains rejection status payload
-		json.NewEncoder(w).Encode(resp)
+		// The rejection is part of the protocol, so it is cached as well:
+		// retrying the same charge must not flip a rejected payment.
+		remember(idempotencyKey, resp)
 
-		log.Printf("[Gateway Sync Rejection] Payment rejected immediately for Internal ID: %s, Order ID: %s\n", req.PaymentID, req.OrderID)
+		writeJSON(w, http.StatusOK, resp)
+		log.Printf("[Gateway Sync Rejection] Payment rejected immediately for Internal ID: %s, Order ID: %s", req.PaymentID, req.OrderID)
 		return
 	}
 
-	// Send an immediate successful response containing the checkout dynamic link
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(resp)
+	remember(idempotencyKey, resp)
 
-	log.Printf("[Gateway Session Created] Reference ID: %s | Order: %s | Idempotency Key: %s | Amount: %d %s\n",
-		req.PaymentID, req.OrderID, idempotencyKey, req.Amount, req.Currency)
+	// Send an immediate successful response containing the checkout dynamic link
+	writeJSON(w, http.StatusCreated, resp)
+
+	log.Printf("[Gateway Session Created] Reference ID: %s | Order: %s | Idempotency Key: %s | Amount: %s %s",
+		req.PaymentID, req.OrderID, idempotencyKey, req.Amount.String(), req.Currency)
+
+	if req.WebhookURL == "" {
+		log.Printf("[Gateway Async Event] no webhook_url supplied for payment %s; skipping callback", req.PaymentID)
+		return
+	}
 
 	// Asynchronously trigger customer interaction delay & webhook dispatching thread
 	go simulateUserPayment(req.PaymentID, req.OrderID, mockTxID, req.WebhookURL)
+}
+
+func remember(key string, resp GatewayResponse) {
+	if key == "" {
+		return
+	}
+
+	idempotencyMu.Lock()
+	idempotency[key] = resp
+	idempotencyMu.Unlock()
 }
 
 // simulateUserPayment mimics async credit card processor delays and callback execution
@@ -113,39 +181,94 @@ func simulateUserPayment(paymentID, orderID, txID, webhookURL string) {
 	holdTime := time.Duration(rand.Intn(3)+2) * time.Second
 	time.Sleep(holdTime)
 
-	// Simulate authorization outcome: 80% success rate, 20% failure rate (e.g., insufficient funds)
+	// Simulate authorization outcome: 80% success rate, 20% failure rate
+	// (e.g., insufficient funds), unless GATEWAY_SIMULATION pins it.
 	status := "SUCCESSFUL"
-	if rand.Float32() < 0.20 {
+	switch simulation {
+	case simulationSuccess:
+		status = "SUCCESSFUL"
+	case simulationFailed:
 		status = "FAILED"
+	default:
+		if rand.Float32() < 0.20 {
+			status = "FAILED"
+		}
 	}
 
-	notification := WebhookNotification{
+	payload, err := json.Marshal(WebhookNotification{
 		PaymentID: paymentID, // Passing back our core service internal record identity
 		OrderID:   orderID,
 		Status:    status,
-	}
-
-	payload, _ := json.Marshal(notification)
-
-	h := hmac.New(sha256.New, []byte("my-secret-key"))
-	h.Write(payload)
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	log.Printf("[Gateway Async Event] Sending webhook payload back to PaymentService (%s) -> Status: %s\n", webhookURL, status)
-
-	req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(payload))
+	})
 	if err != nil {
-		log.Printf("Failed to create request: %v", err)
+		log.Printf("[Gateway Async Event] failed to marshal webhook payload: %v", err)
 		return
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Signature", signature)
+	mac := hmac.New(sha256.New, []byte(webhookSecret))
+	mac.Write(payload)
+	signature := hex.EncodeToString(mac.Sum(nil))
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	log.Printf("[Gateway Async Event] Sending webhook payload back to PaymentService (%s) -> Status: %s", webhookURL, status)
 
-	resp, err := client.Do(req)
-	defer resp.Body.Close()
+	// The gateway retries callbacks: the payment service must be idempotent.
+	deliverWebhook(webhookURL, payload, signature)
+}
 
-	log.Printf("[Gateway Async Event] Webhook delivered securely, microservice response: %d\n", resp.StatusCode)
+func deliverWebhook(webhookURL string, payload []byte, signature string) {
+	client := &http.Client{Timeout: webhookTimeout}
+
+	var lastErr error
+
+	for attempt := 1; attempt <= webhookAttempts; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(payload))
+		if err != nil {
+			// A malformed URL cannot be fixed by retrying.
+			log.Printf("[Gateway Async Event] failed to build webhook request: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Signature", signature)
+
+		resp, err := client.Do(req)
+		switch {
+		case err != nil:
+			lastErr = err
+			log.Printf("[Gateway Async Event] webhook attempt %d/%d failed: %v", attempt, webhookAttempts, err)
+		default:
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+			// The body must be closed before the response is discarded; a nil
+			// response cannot be dereferenced (the previous code did exactly
+			// that and panicked whenever the payment service was down).
+			_ = resp.Body.Close()
+
+			if readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				log.Printf("[Gateway Async Event] webhook delivered, payment service answered %d", resp.StatusCode)
+				return
+			}
+
+			lastErr = fmt.Errorf("status %s: %s", resp.Status, string(bytes.TrimSpace(body)))
+			log.Printf("[Gateway Async Event] webhook attempt %d/%d rejected: %v", attempt, webhookAttempts, lastErr)
+		}
+
+		if attempt < webhookAttempts {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+
+	log.Printf("[Gateway Async Event] giving up after %d attempts: %v", webhookAttempts, lastErr)
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+
+	return fallback
 }
